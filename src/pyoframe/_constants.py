@@ -26,6 +26,7 @@ class _Solver:
     supports_non_convex: bool = True
     supports_duals: bool = True
     supports_objective_sense: bool = True
+    supports_sos: bool = True
     supports_write: bool = True
     accelerate_with_repeat_names: bool = False
     """
@@ -57,10 +58,12 @@ SUPPORTED_SOLVERS = [
         supports_quadratic_constraints=False,
         supports_non_convex=False,
         supports_duals=False,
+        supports_sos=False,
     ),
     _Solver(
         "ipopt",
         supports_integer_variables=False,
+        supports_sos=False,
         supports_objective_sense=False,
         supports_write=False,
     ),

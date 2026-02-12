@@ -24,6 +24,7 @@ from pyoframe._constants import (
 from pyoframe._core import Constraint, Operable, Variable
 from pyoframe._model_element import BaseBlock
 from pyoframe._objective import Objective
+from pyoframe._sos import SOSConstraint
 from pyoframe._utils import Container, NamedVariableMapper, for_solvers, get_obj_repr
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -94,6 +95,7 @@ class Model:
         "maximize",
         "_logger",
         "_last_log",
+        "_sos_constraints",
     ]
 
     def __init__(
@@ -111,6 +113,7 @@ class Model:
         self.solver_name: str = self.solver.name
         self._variables: list[Variable] = []
         self._constraints: list[Constraint] = []
+        self._sos_constraints: list[SOSConstraint] = []
         self.sense: ObjSense | None = ObjSense(sense) if sense is not None else None
         self._objective: Objective | None = None
         self._var_map = NamedVariableMapper() if print_uses_variable_names else None
@@ -324,6 +327,11 @@ class Model:
         return self._constraints
 
     @property
+    def sos_constraints(self) -> list[SOSConstraint]:
+        """Returns the model's SOS constraints."""
+        return self._sos_constraints
+
+    @property
     def has_objective(self) -> bool:
         """Returns whether the model's objective has been defined.
 
@@ -429,6 +437,10 @@ class Model:
                     self._var_map.add(__value)
                 if log:
                     type_name = "variable"
+            elif isinstance(__value, SOSConstraint):
+                self._sos_constraints.append(__value)
+                if log:
+                    type_name = "sos_constraint"
             elif isinstance(__value, Constraint):
                 self._constraints.append(__value)
                 if log:

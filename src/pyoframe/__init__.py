@@ -12,6 +12,8 @@ from pyoframe._model import Model
 from pyoframe._monkey_patch import patch_dataframe_libraries
 from pyoframe._objective import Objective
 from pyoframe._param import Param
+from pyoframe._piecewise import piecewise_linear
+from pyoframe._sos import SOS1, SOS2, SOSConstraint
 
 try:
     from pyoframe._version import __version__, __version_tuple__  # noqa: F401
@@ -34,4 +36,8 @@ __all__ = [
     "VType",
     "ObjSense",
     "PyoframeError",
+    "SOS1",
+    "SOS2",
+    "SOSConstraint",
+    "piecewise_linear",
 ]
