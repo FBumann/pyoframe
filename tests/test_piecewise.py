@@ -7,12 +7,13 @@ import pyoframe as pf
 from pyoframe._constants import SUPPORTED_SOLVERS
 
 
-def _sos_solvers():
-    """Return solvers that support SOS constraints."""
-    return [s for s in SUPPORTED_SOLVERS if s.supports_sos]
+def _sos_capable_solvers():
+    """Return solvers that support SOS constraints (natively or via Big-M reformulation)."""
+    return [s for s in SUPPORTED_SOLVERS
+            if s.supports_sos or s.supports_integer_variables]
 
 
-@pytest.fixture(params=_sos_solvers(), ids=lambda s: s.name)
+@pytest.fixture(params=_sos_capable_solvers(), ids=lambda s: s.name)
 def sos_solver(request):
     from tests.conftest import _installed_solvers
 

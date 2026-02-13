@@ -7,12 +7,13 @@ import pyoframe as pf
 from pyoframe._constants import SUPPORTED_SOLVERS, _Solver
 
 
-def _sos_solvers():
-    """Return solvers that support SOS constraints."""
-    return [s for s in SUPPORTED_SOLVERS if s.supports_sos]
+def _sos_capable_solvers():
+    """Return solvers that support SOS constraints (natively or via Big-M reformulation)."""
+    return [s for s in SUPPORTED_SOLVERS
+            if s.supports_sos or s.supports_integer_variables]
 
 
-@pytest.fixture(params=_sos_solvers(), ids=lambda s: s.name)
+@pytest.fixture(params=_sos_capable_solvers(), ids=lambda s: s.name)
 def sos_solver(request):
     from tests.conftest import _installed_solvers
 
@@ -106,10 +107,11 @@ def test_sos_invalid_by_dimension(sos_solver):
 
 
 def test_sos_unsupported_solver():
-    """Error when solver doesn't support SOS."""
-    unsupported = [s for s in SUPPORTED_SOLVERS if not s.supports_sos]
+    """Error when solver supports neither SOS nor integer variables."""
+    unsupported = [s for s in SUPPORTED_SOLVERS
+                   if not s.supports_sos and not s.supports_integer_variables]
     if not unsupported:
-        pytest.skip("All solvers support SOS")
+        pytest.skip("All solvers support SOS or integer variables")
 
     from tests.conftest import _installed_solvers
 
@@ -119,18 +121,93 @@ def test_sos_unsupported_solver():
             solver = s
             break
     if solver is None:
-        pytest.skip("No unsupported SOS solver installed")
+        pytest.skip("No unsupported solver installed")
 
     m = pf.Model(solver)
     m.x = pf.Variable(pf.Set(i=[1, 2, 3]), lb=0)
-    with pytest.raises(pf.PyoframeError, match="does not support SOS"):
+    with pytest.raises(pf.PyoframeError, match="does not support SOS constraints and cannot use Big-M"):
         m.sos = pf.SOS1(m.x)
 
 
 def test_sos_model_tracking(sos_solver):
     """SOS constraints are tracked in model.sos_constraints."""
     m = pf.Model(sos_solver)
-    m.x = pf.Variable(pf.Set(i=[1, 2, 3]), lb=0)
+    m.x = pf.Variable(pf.Set(i=[1, 2, 3]), lb=0, ub=10)
     assert len(m.sos_constraints) == 0
     m.sos = pf.SOS1(m.x)
     assert len(m.sos_constraints) == 1
+
+
+def test_sos_reformulation_requires_finite_ub():
+    """Big-M reformulation errors when variable has no finite upper bound and no big_m."""
+    solvers = [s for s in SUPPORTED_SOLVERS
+               if not s.supports_sos and s.supports_integer_variables]
+    if not solvers:
+        pytest.skip("No solver needs Big-M reformulation")
+
+    from tests.conftest import _installed_solvers
+
+    solver = None
+    for s in solvers:
+        if s in _installed_solvers:
+            solver = s
+            break
+    if solver is None:
+        pytest.skip("No Big-M solver installed")
+
+    m = pf.Model(solver)
+    m.x = pf.Variable(pf.Set(i=[1, 2, 3]), lb=0)
+    with pytest.raises(pf.PyoframeError, match="Cannot determine Big-M"):
+        m.sos = pf.SOS1(m.x)
+
+
+def test_sos_reformulation_custom_big_m():
+    """Big-M reformulation uses provided big_m value."""
+    solvers = [s for s in SUPPORTED_SOLVERS
+               if not s.supports_sos and s.supports_integer_variables]
+    if not solvers:
+        pytest.skip("No solver needs Big-M reformulation")
+
+    from tests.conftest import _installed_solvers
+
+    solver = None
+    for s in solvers:
+        if s in _installed_solvers:
+            solver = s
+            break
+    if solver is None:
+        pytest.skip("No Big-M solver installed")
+
+    m = pf.Model(solver)
+    m.x = pf.Variable(pf.Set(i=[1, 2, 3]), lb=0)
+    m.sos = pf.SOS1(m.x, big_m=100)
+    m.maximize = m.x.sum()
+
+    m.optimize()
+    sol = m.x.solution
+    assert sol["solution"].sum() == approx(100, abs=1e-4)
+    non_zero = (sol["solution"].abs() > 1e-6).sum()
+    assert non_zero <= 1
+
+
+def test_sos_reformulation_negative_lb_error():
+    """Big-M reformulation errors when variable has negative lower bound."""
+    solvers = [s for s in SUPPORTED_SOLVERS
+               if not s.supports_sos and s.supports_integer_variables]
+    if not solvers:
+        pytest.skip("No solver needs Big-M reformulation")
+
+    from tests.conftest import _installed_solvers
+
+    solver = None
+    for s in solvers:
+        if s in _installed_solvers:
+            solver = s
+            break
+    if solver is None:
+        pytest.skip("No Big-M solver installed")
+
+    m = pf.Model(solver)
+    m.x = pf.Variable(pf.Set(i=[1, 2, 3]), lb=-1, ub=10)
+    with pytest.raises(pf.PyoframeError, match="non-negative lower bounds"):
+        m.sos = pf.SOS1(m.x)
