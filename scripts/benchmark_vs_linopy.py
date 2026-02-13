@@ -5,17 +5,25 @@ Measures the full roundtrip from model creation to solution retrieval,
 then subtracts Gurobi's self-reported solver time (RunTime) to isolate
 pure modeling overhead.
 
+Memory is measured in a separate pass (--memory) using isolated subprocesses
+so that RSS captures all allocators (Python, Rust/polars, C/numpy, Gurobi).
+
 Usage:
     python scripts/benchmark_vs_linopy.py
     python scripts/benchmark_vs_linopy.py --sizes 10 50 100 500 1000
     python scripts/benchmark_vs_linopy.py --runs 5 --csv results.csv
+    python scripts/benchmark_vs_linopy.py --memory
     python scripts/benchmark_vs_linopy.py --plot
     python scripts/benchmark_vs_linopy.py --problem dense_2d --sizes 10 50 100
 """
 
 import argparse
 import gc
+import json
+import os
 import statistics
+import subprocess
+import sys
 import time
 from abc import ABC, abstractmethod
 
@@ -37,8 +45,8 @@ class Problem(ABC):
 
     Subclasses define a specific LP/MIP structure and implement it for both
     pyoframe and linopy.  Each implementation returns:
-      - timings dict with at least "data", "build", "solve_wall", "gurobi_runtime",
-        "solution", "overhead"
+      - timings dict with at least "data", "build", "solve_wall",
+        "gurobi_runtime", "solution", "overhead"
       - the objective value (for correctness checks)
     """
 
@@ -166,7 +174,7 @@ DEFAULT_SIZES = [10, 50, 100, 200, 500, 1000]
 
 
 # ---------------------------------------------------------------------------
-# Benchmark runner
+# Performance benchmark runner
 # ---------------------------------------------------------------------------
 
 def run_benchmarks(problem: Problem, sizes: list[int], num_runs: int = 3):
@@ -223,6 +231,138 @@ def run_benchmarks(problem: Problem, sizes: list[int], num_runs: int = 3):
 
 
 # ---------------------------------------------------------------------------
+# Memory benchmark (subprocess-isolated)
+# ---------------------------------------------------------------------------
+
+def _get_rss_mb():
+    """Current RSS of this process in MB (works on macOS and Linux)."""
+    # ps reports RSS in KB on both macOS and Linux
+    out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
+    return int(out.strip()) / 1024
+
+
+_MEMORY_WORKER_SCRIPT = """
+import gc, json, os, subprocess, sys
+
+def get_rss_mb():
+    out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
+    return int(out.strip()) / 1024
+
+# ---- imports (part of baseline) ----
+import numpy as np
+import pandas as pd
+import polars as pl
+import xarray as xr
+import linopy
+import pyoframe as pf
+
+problem_name = sys.argv[1]
+lib = sys.argv[2]
+N = int(sys.argv[3])
+
+# Reconstruct the problem
+from benchmark_vs_linopy import PROBLEMS
+problem = PROBLEMS[problem_name]
+
+# Warmup
+if lib == "pyoframe":
+    problem.run_pyoframe(2)
+else:
+    problem.run_linopy(2)
+
+# Measure
+gc.collect()
+rss_before = get_rss_mb()
+
+if lib == "pyoframe":
+    _, obj = problem.run_pyoframe(N)
+else:
+    _, obj = problem.run_linopy(N)
+
+# Don't gc — measure what's alive after the full roundtrip
+rss_after = get_rss_mb()
+
+gc.collect()
+rss_after_gc = get_rss_mb()
+
+print(json.dumps({
+    "rss_before": rss_before,
+    "rss_after": rss_after,
+    "rss_after_gc": rss_after_gc,
+    "rss_delta": rss_after - rss_before,
+    "rss_delta_gc": rss_after_gc - rss_before,
+    "obj": obj,
+}))
+"""
+
+
+def _run_memory_worker(problem_name: str, lib: str, N: int) -> dict:
+    """Spawn a subprocess to measure memory for one (lib, N) combination."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    result = subprocess.run(
+        [sys.executable, "-c", _MEMORY_WORKER_SCRIPT, problem_name, lib, str(N)],
+        capture_output=True,
+        text=True,
+        cwd=script_dir,
+        env={**os.environ, "PYTHONPATH": script_dir},
+    )
+    if result.returncode != 0:
+        print(f"  Worker failed ({lib} N={N}):")
+        # Only print last few lines of stderr to avoid Gurobi license noise
+        err_lines = result.stderr.strip().splitlines()
+        for line in err_lines[-5:]:
+            print(f"    {line}")
+        return {}
+    # The JSON is on the last non-empty line (skip Gurobi license output)
+    for line in reversed(result.stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    print(f"  Worker produced no JSON ({lib} N={N})")
+    return {}
+
+
+def run_memory_benchmarks(problem: Problem, sizes: list[int], num_runs: int = 3):
+    """Run memory benchmarks in isolated subprocesses."""
+    results = []
+
+    for N in sizes:
+        n_vars = problem.var_count(N)
+        n_cons = problem.con_count(N)
+        print(f"\nN = {N} ({n_vars:,} variables, {n_cons:,} constraints)")
+
+        pf_deltas = []
+        lp_deltas = []
+
+        for run in range(num_runs):
+            pf_result = _run_memory_worker(problem.name, "pyoframe", N)
+            lp_result = _run_memory_worker(problem.name, "linopy", N)
+
+            if pf_result and lp_result:
+                pf_deltas.append(pf_result["rss_delta"])
+                lp_deltas.append(lp_result["rss_delta"])
+                print(
+                    f"  Run {run + 1}/{num_runs}: "
+                    f"pyoframe {pf_result['rss_delta']:+.1f} MB, "
+                    f"linopy {lp_result['rss_delta']:+.1f} MB"
+                )
+            else:
+                print(f"  Run {run + 1}/{num_runs}: measurement failed")
+
+        if pf_deltas and lp_deltas:
+            pf_med = statistics.median(pf_deltas)
+            lp_med = statistics.median(lp_deltas)
+            results.append({
+                "N": N,
+                "pyoframe_mb": pf_med,
+                "linopy_mb": lp_med,
+                "ratio": pf_med / lp_med if lp_med > 0 else float("inf"),
+            })
+
+    return pd.DataFrame(results)
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -232,6 +372,14 @@ def fmt_time(t):
     if t < 0.1:
         return f"{t * 1000:>9.2f} ms"
     return f"{t:>9.4f}  s"
+
+
+def fmt_mem(mb):
+    if mb < 1:
+        return f"{mb * 1024:>8.0f} KB"
+    if mb < 1024:
+        return f"{mb:>8.1f} MB"
+    return f"{mb / 1024:>8.2f} GB"
 
 
 def _print_table(df, phase, label=None):
@@ -260,12 +408,31 @@ def print_results(df, problem: Problem):
     print(f"  {'─' * 74}")
 
 
-def plot_results(df, problem: Problem):
+def print_memory_results(df, problem: Problem):
+    print(f"\n{'=' * 78}")
+    print(f"  MEMORY — {problem.description}")
+    print(f"  RSS delta = process RSS after roundtrip - before (median of runs)")
+    print(f"{'=' * 78}")
+
+    print(f"\n  {'N':>6}  {'pyoframe':>12}  {'linopy':>12}  {'pf / lp':>10}")
+    print(f"  {'':->6}  {'':->12}  {'':->12}  {'':->10}")
+    for _, r in df.iterrows():
+        print(
+            f"  {int(r['N']):>6}  {fmt_mem(r['pyoframe_mb'])}  {fmt_mem(r['linopy_mb'])}  {r['ratio']:>10.2f}x"
+        )
+
+    print(f"\n  {'─' * 74}")
+    print(f"  ratio < 1 → pyoframe uses less memory")
+    print(f"  {'─' * 74}")
+
+
+def plot_results(df, problem: Problem, mem_df=None):
     import matplotlib.pyplot as plt
 
+    n_plots = 3 if mem_df is None else 4
     phases = ["overhead", "data", "gurobi_runtime"]
     labels = ["Modeling overhead", "Data creation", "Gurobi solve"]
-    fig, axes = plt.subplots(1, len(phases), figsize=(5 * len(phases), 4.5))
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4.5))
 
     for ax, phase, label in zip(axes, phases, labels):
         rows = df[df["phase"] == phase]
@@ -274,6 +441,16 @@ def plot_results(df, problem: Problem):
         ax.set_title(label)
         ax.set_xlabel("N")
         ax.set_ylabel("Time (s)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    if mem_df is not None:
+        ax = axes[3]
+        ax.loglog(mem_df["N"], mem_df["pyoframe_mb"], "o-", label="pyoframe", color="tab:blue")
+        ax.loglog(mem_df["N"], mem_df["linopy_mb"], "s-", label="linopy", color="tab:orange")
+        ax.set_title("Memory (RSS delta)")
+        ax.set_xlabel("N")
+        ax.set_ylabel("MB")
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -294,16 +471,15 @@ def main():
         description="Benchmark pyoframe vs linopy (modeling overhead)"
     )
     parser.add_argument(
-        "--problem",
-        choices=list(PROBLEMS),
-        default="dense_2d",
-        help=f"Problem to benchmark (default: dense_2d)",
+        "--problem", choices=list(PROBLEMS), default="dense_2d",
+        help="Problem to benchmark (default: dense_2d)",
     )
     parser.add_argument(
         "--sizes", type=int, nargs="+", default=DEFAULT_SIZES,
         help=f"Problem sizes N (default: {DEFAULT_SIZES})",
     )
     parser.add_argument("--runs", type=int, default=3, help="Runs per size (default: 3)")
+    parser.add_argument("--memory", action="store_true", help="Run memory benchmark (separate pass)")
     parser.add_argument("--plot", action="store_true", help="Show log-log plots")
     parser.add_argument("--csv", type=str, default=None, help="Save results to CSV")
     args = parser.parse_args()
@@ -312,14 +488,29 @@ def main():
     print(f"Benchmark: pyoframe vs linopy — {problem.description}")
     print(f"Sizes: {args.sizes}, Runs: {args.runs}, Solver: Gurobi (direct)")
 
-    df = run_benchmarks(problem, args.sizes, args.runs)
-    print_results(df, problem)
+    # Performance
+    perf_df = run_benchmarks(problem, args.sizes, args.runs)
+    print_results(perf_df, problem)
+
+    # Memory (separate pass)
+    mem_df = None
+    if args.memory:
+        print(f"\n{'─' * 78}")
+        print("Running memory benchmarks (isolated subprocesses)...")
+        mem_df = run_memory_benchmarks(problem, args.sizes, args.runs)
+        print_memory_results(mem_df, problem)
 
     if args.csv:
-        df.to_csv(args.csv, index=False)
-        print(f"\nResults saved to {args.csv}")
+        perf_df.to_csv(args.csv, index=False)
+        if mem_df is not None:
+            mem_csv = args.csv.replace(".csv", "_memory.csv")
+            mem_df.to_csv(mem_csv, index=False)
+            print(f"\nResults saved to {args.csv} and {mem_csv}")
+        else:
+            print(f"\nResults saved to {args.csv}")
+
     if args.plot:
-        plot_results(df, problem)
+        plot_results(perf_df, problem, mem_df)
 
 
 if __name__ == "__main__":
