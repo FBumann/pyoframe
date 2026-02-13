@@ -199,6 +199,106 @@ class SparseNetwork(Problem):
         return timings, obj_val
 
 
+class ManySmallVars(Problem):
+    """Per-variable overhead benchmark: N scalar variables.
+
+    Tests the fixed cost of creating and registering each variable
+    when there are many small (scalar) variables rather than a few
+    large indexed ones.
+
+    Variables:   x_0, x_1, ..., x_{N-1}  (scalar, lb=0)  → N variables
+    Constraints: x_i + x_{i+1} <= 1  for i in 0..N-2     → N-1 constraints
+    Objective:   minimize sum(cost_i * x_i)
+    """
+
+    name = "many_small_vars"
+    description = "N scalar variables with chain constraints"
+
+    @staticmethod
+    def var_count(N: int) -> int:
+        return N
+
+    @staticmethod
+    def con_count(N: int) -> int:
+        return N - 1
+
+    @staticmethod
+    def _make_costs(N):
+        np.random.seed(42)
+        return np.random.rand(N)
+
+    def run_pyoframe(self, N):
+        timings = {}
+
+        t0 = time.perf_counter()
+        costs = self._make_costs(N)
+        timings["data"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m = pf.Model("gurobi")
+        m.attr.Silent = True
+        xs = []
+        for i in range(N):
+            v = pf.Variable(lb=0)
+            setattr(m, f"x{i}", v)
+            xs.append(v)
+        for i in range(N - 1):
+            setattr(m, f"c{i}", xs[i] + xs[i + 1] <= 1)
+        m.minimize = sum(costs[i] * xs[i] for i in range(N))
+        timings["build"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m.optimize()
+        timings["solve_wall"] = time.perf_counter() - t0
+        timings["gurobi_runtime"] = m.attr.SolveTimeSec
+
+        t0 = time.perf_counter()
+        for v in xs:
+            _ = v.solution
+        obj_val = m.minimize.value
+        timings["solution"] = time.perf_counter() - t0
+
+        timings["overhead"] = (
+            timings["build"] + timings["solve_wall"] + timings["solution"]
+            - timings["gurobi_runtime"]
+        )
+        return timings, obj_val
+
+    def run_linopy(self, N):
+        timings = {}
+
+        t0 = time.perf_counter()
+        costs = self._make_costs(N)
+        timings["data"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m = linopy.Model()
+        xs = []
+        for i in range(N):
+            xs.append(m.add_variables(name=f"x{i}", lower=0))
+        for i in range(N - 1):
+            m.add_constraints(xs[i] + xs[i + 1] <= 1, name=f"c{i}")
+        m.add_objective(sum(costs[i] * xs[i] for i in range(N)))
+        timings["build"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m.solve(solver_name="gurobi", io_api="direct", OutputFlag=0)
+        timings["solve_wall"] = time.perf_counter() - t0
+        timings["gurobi_runtime"] = m.solver_model.Runtime
+
+        t0 = time.perf_counter()
+        for v in xs:
+            _ = v.solution
+        obj_val = m.objective.value
+        timings["solution"] = time.perf_counter() - t0
+
+        timings["overhead"] = (
+            timings["build"] + timings["solve_wall"] + timings["solution"]
+            - timings["gurobi_runtime"]
+        )
+        return timings, obj_val
+
+
 class Dense2D(Problem):
     """Linopy's standard benchmark LP.
 
@@ -297,7 +397,7 @@ class Dense2D(Problem):
 
 
 # Registry — add new Problem subclasses here
-PROBLEMS: dict[str, Problem] = {p.name: p for p in [Dense2D(), SparseNetwork()]}
+PROBLEMS: dict[str, Problem] = {p.name: p for p in [Dense2D(), SparseNetwork(), ManySmallVars()]}
 
 DEFAULT_SIZES = [10, 50, 100, 200, 500, 1000]
 
