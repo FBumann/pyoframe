@@ -70,6 +70,135 @@ class Problem(ABC):
         return 2 * N * N
 
 
+class SparseNetwork(Problem):
+    """Sparse graph benchmark: K random outgoing edges per node.
+
+    N nodes, each with K=10 random outgoing edges → ~K*N edges total.
+    As N grows, density (K/N) drops, so pyoframe's COO representation
+    (polars DataFrame storing only existing edges) should increasingly
+    outperform linopy's dense NxN xarray with boolean mask.
+
+    Variables:   x[i,j] on edges only, lb=0          → K*N variables
+    Constraints: sum_j(x[i,j]) <= 1 for each node i  → N constraints
+    Objective:   minimize sum(cost * x)
+    """
+
+    name = "sparse_network"
+    description = "sparse graph K=10 edges/node, K*N vars on N² grid"
+    K = 10
+
+    @staticmethod
+    def var_count(N: int) -> int:
+        return SparseNetwork.K * N
+
+    @staticmethod
+    def con_count(N: int) -> int:
+        return N
+
+    @staticmethod
+    def _make_graph(N):
+        """Generate random edges: K distinct destinations per source node.
+
+        Returns (src, dst, cost) arrays, each of length K*N.
+        """
+        K = min(SparseNetwork.K, N)
+        np.random.seed(42)
+        src_list = []
+        dst_list = []
+        for i in range(N):
+            destinations = np.random.choice(N, size=K, replace=False)
+            src_list.append(np.full(K, i, dtype=np.int64))
+            dst_list.append(destinations.astype(np.int64))
+        src = np.concatenate(src_list)
+        dst = np.concatenate(dst_list)
+        cost = np.random.rand(len(src))
+        return src, dst, cost
+
+    @staticmethod
+    def _make_data_pyoframe(N):
+        src, dst, cost = SparseNetwork._make_graph(N)
+        edges = pl.DataFrame({"i": src, "j": dst})
+        costs = edges.with_columns(pl.Series("cost", cost))
+        return edges, costs
+
+    @staticmethod
+    def _make_data_linopy(N):
+        src, dst, cost = SparseNetwork._make_graph(N)
+        i_coords = pd.Index(range(N), name="i")
+        j_coords = pd.Index(range(N), name="j")
+
+        mask_np = np.zeros((N, N), dtype=bool)
+        mask_np[src, dst] = True
+        mask = xr.DataArray(mask_np, dims=["i", "j"], coords={"i": i_coords, "j": j_coords})
+
+        cost_np = np.full((N, N), np.nan)
+        cost_np[src, dst] = cost
+        cost_da = xr.DataArray(cost_np, dims=["i", "j"], coords={"i": i_coords, "j": j_coords})
+
+        return i_coords, j_coords, mask, cost_da
+
+    def run_pyoframe(self, N):
+        timings = {}
+
+        t0 = time.perf_counter()
+        edges, costs = self._make_data_pyoframe(N)
+        timings["data"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m = pf.Model("gurobi")
+        m.attr.Silent = True
+        m.x = pf.Variable(edges, lb=0)
+        m.cap = m.x.sum("j") <= 1
+        m.minimize = (pf.Param(costs) * m.x).sum()
+        timings["build"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m.optimize()
+        timings["solve_wall"] = time.perf_counter() - t0
+        timings["gurobi_runtime"] = m.attr.SolveTimeSec
+
+        t0 = time.perf_counter()
+        _ = m.x.solution
+        obj_val = m.minimize.value
+        timings["solution"] = time.perf_counter() - t0
+
+        timings["overhead"] = (
+            timings["build"] + timings["solve_wall"] + timings["solution"]
+            - timings["gurobi_runtime"]
+        )
+        return timings, obj_val
+
+    def run_linopy(self, N):
+        timings = {}
+
+        t0 = time.perf_counter()
+        i_coords, j_coords, mask, cost_da = self._make_data_linopy(N)
+        timings["data"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m = linopy.Model()
+        x = m.add_variables(lower=0, coords=[i_coords, j_coords], name="x", mask=mask)
+        m.add_constraints(x.sum("j") <= 1, name="cap")
+        m.add_objective((cost_da * x).sum())
+        timings["build"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        m.solve(solver_name="gurobi", io_api="direct", OutputFlag=0)
+        timings["solve_wall"] = time.perf_counter() - t0
+        timings["gurobi_runtime"] = m.solver_model.Runtime
+
+        t0 = time.perf_counter()
+        _ = x.solution
+        obj_val = m.objective.value
+        timings["solution"] = time.perf_counter() - t0
+
+        timings["overhead"] = (
+            timings["build"] + timings["solve_wall"] + timings["solution"]
+            - timings["gurobi_runtime"]
+        )
+        return timings, obj_val
+
+
 class Dense2D(Problem):
     """Linopy's standard benchmark LP.
 
@@ -168,7 +297,7 @@ class Dense2D(Problem):
 
 
 # Registry — add new Problem subclasses here
-PROBLEMS: dict[str, Problem] = {p.name: p for p in [Dense2D()]}
+PROBLEMS: dict[str, Problem] = {p.name: p for p in [Dense2D(), SparseNetwork()]}
 
 DEFAULT_SIZES = [10, 50, 100, 200, 500, 1000]
 
